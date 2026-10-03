@@ -177,3 +177,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+import subprocess
+subprocess.call("echo hello", shell=True)
