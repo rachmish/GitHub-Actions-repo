@@ -1,0 +1,2 @@
+# Pinned versions so every run is repeatable and auditable
+pytest==8.3.3

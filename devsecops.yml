@@ -1,0 +1,87 @@
+name: DevSecOps
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+  IMAGE_NAME: "simple-app"
+
+jobs:
+  # 1. Find passwords, keys, or tokens committed by mistake
+  secret-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Scan full history, not just the latest commit
+      - name: Scan for secrets (Gitleaks)
+        run: |
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.18.4 \
+            detect --source /repo --verbose --redact
+
+  # 2. Find insecure coding patterns (SAST)
+  code-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install scanners
+        run: pip install bandit==1.7.10 ruff==0.6.9
+      - name: Lint (Ruff)
+        run: ruff check .
+      - name: Security scan (Bandit, medium severity and above)
+        run: bandit -r . -ll -x ./test_app.py
+
+  # 3. Find libraries with known vulnerabilities (SCA)
+  dependency-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Audit dependencies (pip-audit)
+        run: |
+          pip install pip-audit==2.7.3
+          pip-audit -r requirements.txt
+
+  # 4. Make sure the app works
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run tests
+        run: pytest -v
+
+  # 5. Build the container and scan it (runs only if all checks above pass)
+  container-scan:
+    needs: [secret-scan, code-scan, dependency-scan, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t "${IMAGE_NAME}:${GITHUB_SHA}" .
+      - name: Scan image (Trivy, fail on HIGH or CRITICAL)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.56.2 image \
+            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 \
+            "${IMAGE_NAME}:${GITHUB_SHA}"
