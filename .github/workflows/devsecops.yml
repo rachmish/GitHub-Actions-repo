@@ -1,0 +1,92 @@
+name: DevSecOps
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  APP_DIR: simple-web-app
+  K8S_DIR: simple-web-app/k8s
+  PYTHON_VERSION: "3.13"
+  IMAGE_NAME: simple-web-app
+  APP_PORT: "8080"
+
+jobs:
+  # 1. Find passwords, keys, or tokens committed by mistake
+  secret-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan for secrets (Gitleaks)
+        run: |
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.18.4 \
+            detect --source /repo --verbose --redact
+
+  # 2. Find insecure coding patterns in the Python code (SAST)
+  code-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install scanners
+        run: pip install bandit==1.7.10 ruff==0.6.9
+      - name: Lint (Ruff)
+        run: ruff check "$APP_DIR"
+      # B104 (binding to 0.0.0.0) is skipped on purpose: a container must
+      # listen on all interfaces to receive traffic from Kubernetes.
+      - name: Security scan (Bandit, medium severity and above)
+        run: bandit -r "$APP_DIR" -ll -s B104
+
+  # 3. Check the Kubernetes manifest and Dockerfile for misconfigurations
+  config-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Kubernetes schema (kubeconform)
+        run: |
+          docker run --rm -v "$PWD:/repo" ghcr.io/yannh/kubeconform:v0.6.7 \
+            -strict -summary "/repo/$K8S_DIR"
+      - name: Scan K8s and Dockerfile for misconfigurations (Trivy)
+        run: |
+          docker run --rm -v "$PWD:/repo" aquasec/trivy:0.56.2 config \
+            --severity HIGH,CRITICAL --exit-code 1 "/repo/$APP_DIR"
+
+  # 4. Build, scan the image, and confirm the app actually starts
+  build-and-scan:
+    needs: [secret-scan, code-scan, config-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t "${IMAGE_NAME}:${GITHUB_SHA}" "$APP_DIR"
+      - name: Scan image (Trivy, fail on HIGH or CRITICAL)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.56.2 image \
+            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 \
+            "${IMAGE_NAME}:${GITHUB_SHA}"
+      - name: Smoke test (start container and request the home page)
+        run: |
+          docker run -d --name app -p "${APP_PORT}:${APP_PORT}" "${IMAGE_NAME}:${GITHUB_SHA}"
+          for i in $(seq 1 15); do
+            if curl -fsS "http://localhost:${APP_PORT}/" > /dev/null; then
+              echo "App responded successfully."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "App did not respond in time. Container logs:"
+          docker logs app
+          exit 1
